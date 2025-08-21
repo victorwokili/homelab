@@ -55,5 +55,5 @@ That's it! Your hub is now protected with automated backups.
 
 [backup-hub.sh](https://github.com/victorwokili/homelab/blob/main/nuc-hub.sh)
 
-[restore-hub.sh]sh(https://github.com/victorwokili/homelab/blob/main/restore-hub.sh)
+[restore-hub.sh](https://github.com/victorwokili/homelab/blob/main/restore-hub.sh)
 
