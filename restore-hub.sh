@@ -5,6 +5,7 @@
 #
 # Usage: ./restore-hub.sh /path/to/backup.tar.gz
 #
+
 set -euo pipefail
 
 # ─── CONFIGURATION ──────────────────────────────────────────────────────────────
@@ -22,13 +23,13 @@ CYAN="\e[36m"
 BOLD="\e[1m"
 
 function info {
-  echo -e "${BLUE}[INFO]${RESET} $1"
+  echo -e "${BLUE}[INFO]${RESET}  $1"
 }
 function done_msg {
-  echo -e "${GREEN}[DONE]${RESET} $1"
+  echo -e "${GREEN}[DONE]${RESET}  $1"
 }
 function warn {
-  echo -e "${YELLOW}[WARN]${RESET} $1"
+  echo -e "${YELLOW}[WARN]${RESET}  $1"
 }
 function error {
   echo -e "${RED}[ERROR]${RESET} $1"
@@ -45,16 +46,16 @@ function show_intro() {
   echo
   echo -e "${PURPLE}${BOLD}################################################${RESET}"
   echo -e "${PURPLE}${BOLD}#                                              #${RESET}"
-  echo -e "${PURPLE}${BOLD}#       🪄 AMAZING HUB RESTORE WIZARD 🪄       #${RESET}"
+  echo -e "${PURPLE}${BOLD}#    🪄 AMAZING HUB RESTORE WIZARD 🪄          #${RESET}"
   echo -e "${PURPLE}${BOLD}#                                              #${RESET}"
-  echo -e "${PURPLE}${BOLD}# About to bring your smart home back to life! #${RESET}"
+  echo -e "${PURPLE}${BOLD}#  About to bring your smart home back to life! #${RESET}"
   echo -e "${PURPLE}${BOLD}#                                              #${RESET}"
   echo -e "${PURPLE}${BOLD}################################################${RESET}"
   echo
   magic "✨ This wizard will seamlessly restore ALL your configurations"
   magic "🏠 Home Assistant automations, dashboards, and history"
   magic "📊 Grafana dashboards and years of sensor data"
-  magic "🔐 All security settings and VPN configurations"
+  magic "🔐 All security settings and VPN configurations"  
   magic "🎯 Every service exactly as you left it"
   echo
   echo -e "${CYAN}Your fresh containers will wake up thinking nothing ever happened!${RESET}"
@@ -94,14 +95,14 @@ function validate_backup() {
   if tar tzf "$backup_file" | grep -q "BACKUP_INFO.txt"; then
     echo
     info "📋 Backup Information:"
-    tar xzf "$backup_file" -O BACKUP_INFO.txt 2>/dev/null | head -10 | sed 's/^/  /'
+    tar xzf "$backup_file" -O BACKUP_INFO.txt 2>/dev/null | head -10 | sed 's/^/     /'
     echo
   fi
 }
 
 # ─── SAFETY CHECKS ─────────────────────────────────────────────────────────────
 function safety_checks() {
-  restore_msg "🛡️ Performing safety checks..."
+  restore_msg "🛡️  Performing safety checks..."
   
   # Check if we're root (we shouldn't be)
   if [ "$EUID" -eq 0 ]; then
@@ -141,6 +142,7 @@ function backup_current_data() {
   
   if [ -d "$HUB_ROOT" ] && [ "$(ls -A "$HUB_ROOT" 2>/dev/null)" ]; then
     sudo tar czf "$safety_backup" -C /srv hub 2>/dev/null || true
+    
     if [ -f "$safety_backup" ]; then
       info "Current data backed up to: $safety_backup"
       echo "🔒 If something goes wrong, you can restore with:"
@@ -155,16 +157,19 @@ function backup_current_data() {
 
 # ─── CONTAINER MANAGEMENT ──────────────────────────────────────────────────────
 function stop_containers() {
-  restore_msg "⏸️ Gracefully stopping containers..."
+  restore_msg "⏸️  Gracefully stopping containers..."
   
   local containers=$(docker ps --format '{{.Names}}' 2>/dev/null || true)
   
   if [ -n "$containers" ]; then
     echo "Stopping containers: $containers"
+    
     # Stop containers gracefully
     docker stop $containers >/dev/null 2>&1 || warn "Some containers didn't stop gracefully"
+    
     # Wait a moment for clean shutdown
     sleep 3
+    
     done_msg "Containers stopped"
   else
     info "No running containers found"
@@ -180,6 +185,7 @@ function start_containers() {
   if [ -n "$all_containers" ]; then
     # Start critical services first
     local critical_services="influxdb mosquitto homeassistant pihole"
+    
     for service in $critical_services; do
       if echo "$all_containers" | grep -qw "$service"; then
         info "Starting critical service: $service"
@@ -243,6 +249,7 @@ function perform_restore() {
     
     # Fix permissions
     sudo chown -R "$HUB_USER:$HUB_USER" "$HUB_ROOT"
+    
     done_msg "Hub data restored successfully"
   else
     error "Hub data not found in backup"
@@ -252,26 +259,35 @@ function perform_restore() {
   
   # Restore system configurations
   if [ -f "$restore_dir/system-essentials.tar.gz" ]; then
-    magic "⚙️ Restoring system configurations..."
+    magic "⚙️  Restoring system configurations..."
     sudo tar xzf "$restore_dir/system-essentials.tar.gz" -C / 2>/dev/null || warn "Some system configs couldn't be restored"
+    
+    # Fix WireGuard permissions if restored
+    if [ -d "/home/$HUB_USER/wireguard" ]; then
+      sudo chown -R "$HUB_USER:$HUB_USER" "/home/$HUB_USER/wireguard"
+      info "✅ WireGuard easy access configs restored and permissions fixed"
+    fi
+    
     done_msg "System configurations restored"
   fi
   
   # Cleanup
   rm -rf "$restore_dir"
+  
   magic "🎉 All configurations have been magically restored!"
 }
 
 # ─── SERVICE HEALTH CHECK ──────────────────────────────────────────────────────
 function health_check() {
   restore_msg "🏥 Performing health check..."
-  echo
   
+  echo
   info "Container Status:"
   docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" | head -15
-  echo
   
+  echo
   info "🔍 Checking service accessibility..."
+  
   local services=(
     "Home Assistant:http://$(hostname -I | awk '{print $1}'):8123"
     "Portainer:http://$(hostname -I | awk '{print $1}'):9000"
@@ -282,6 +298,7 @@ function health_check() {
   for service_info in "${services[@]}"; do
     local name=$(echo "$service_info" | cut -d: -f1)
     local url=$(echo "$service_info" | cut -d: -f2-)
+    
     if curl -s --connect-timeout 3 "$url" >/dev/null 2>&1; then
       echo -e "  ✅ $name: ${GREEN}Online${RESET}"
     else
@@ -300,35 +317,50 @@ function show_success() {
   echo
   echo -e "${GREEN}${BOLD}################################################${RESET}"
   echo -e "${GREEN}${BOLD}#                                              #${RESET}"
-  echo -e "${GREEN}${BOLD}#           🎉 RESTORATION COMPLETED! 🎉       #${RESET}"
+  echo -e "${GREEN}${BOLD}#     🎉 RESTORATION COMPLETED! 🎉             #${RESET}"
   echo -e "${GREEN}${BOLD}#                                              #${RESET}"
-  echo -e "${GREEN}${BOLD}#      Your smart home has been brought back   #${RESET}"
-  echo -e "${GREEN}${BOLD}#     to life with ALL your configurations!    #${RESET}"
+  echo -e "${GREEN}${BOLD}#   Your smart home has been brought back      #${RESET}"
+  echo -e "${GREEN}${BOLD}#   to life with ALL your configurations!     #${RESET}"
   echo -e "${GREEN}${BOLD}#                                              #${RESET}"
   echo -e "${GREEN}${BOLD}################################################${RESET}"
   echo
+  
   magic "✨ Your services are waking up with all their memories intact!"
   echo
+  
   echo -e "${CYAN}🌟 What's Been Restored:${RESET}"
   echo "  🏠 Home Assistant - All automations, dashboards & history"
   echo "  📊 Grafana - All your custom dashboards and data sources"
   echo "  💾 InfluxDB - Years of sensor data and measurements"
   echo "  🔒 Pi-hole - Block lists, DNS settings, and configurations"
+  echo "  🔐 WireGuard VPN - All client configs and QR codes"
   echo "  🔌 All other services - Exactly as you left them"
   echo
+  
   echo -e "${CYAN}🚀 Access Your Services:${RESET}"
-  echo "  🏠 Home Assistant: http://$local_ip:8123"
-  echo "  🔧 Portainer: http://$local_ip:9000"
-  echo "  📊 Grafana: http://$local_ip:3000"
-  echo "  🛡️ Pi-hole: http://$local_ip/admin"
-  echo "  📋 Dashboard: http://$local_ip:8201"
+  echo "  🏠 Home Assistant:    http://$local_ip:8123"
+  echo "  🔧 Portainer:         http://$local_ip:9000"
+  echo "  📊 Grafana:           http://$local_ip:3000"
+  echo "  🛡️  Pi-hole:           http://$local_ip/admin"
+  echo "  📋 Dashboard:         http://$local_ip:8201"
   echo
+  
+  # Show WireGuard info if configs exist
+  if [ -d "/home/$HUB_USER/wireguard" ]; then
+    echo -e "${CYAN}🔐 WireGuard VPN Access:${RESET}"
+    echo "  📱 QR Codes:         /home/$HUB_USER/wireguard/qr-codes/"
+    echo "  💻 Config Files:     /home/$HUB_USER/wireguard/configs/"
+    echo "  📖 Instructions:     /home/$HUB_USER/wireguard/README.txt"
+    echo
+  fi
+  
   echo -e "${CYAN}⚡ Pro Tips:${RESET}"
   echo "  • Services may take 1-2 minutes to fully start up"
   echo "  • Check status: docker ps"
   echo "  • View logs: docker logs [service-name]"
   echo "  • All your historical data is preserved!"
   echo
+  
   echo -e "${GREEN}${BOLD}🎯 Mission Accomplished!${RESET}"
   echo -e "${GREEN}Your smart home is back online like nothing ever happened!${RESET}"
   echo
@@ -355,10 +387,11 @@ function main() {
   safety_checks
   
   # Confirm with user
-  echo -e "${YELLOW}⚠️ This will restore configurations from backup and restart all services.${RESET}"
+  echo -e "${YELLOW}⚠️  This will restore configurations from backup and restart all services.${RESET}"
   echo -e "${CYAN}Backup file: $(basename "$backup_file")${RESET}"
   echo
   read -p "$(echo -e "${CYAN}Ready to bring your smart home back to life? (y/N): ${RESET}")" confirm
+  
   if [[ ! $confirm =~ ^[Yy]$ ]]; then
     echo -e "${YELLOW}Restore cancelled. Your services remain untouched.${RESET}"
     exit 0
