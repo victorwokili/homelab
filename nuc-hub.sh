@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 #
-# nuc-hub.sh  —  Turn a Lenovo ThinkCentre (i5-7500T) on Ubuntu 22.04 LTS
-# into a self-updating Smart Home Hub + Mini-Lab with extra fun services,
-# including proper Pi-hole deployment on port 53.
+# enhanced-nuc-hub.sh  —  Modular Smart Home Hub Setup
+# Automatically registers services for backup/restore system
 #
 # Run as:
-#   chmod +x ~/scripts/nuc-hub.sh
-#   ~/scripts/nuc-hub.sh
+#   chmod +x ~/scripts/enhanced-nuc-hub.sh
+#   ~/scripts/enhanced-nuc-hub.sh
 #
 
 set -euo pipefail
@@ -17,6 +16,7 @@ GREEN="\e[32m"
 YELLOW="\e[33m"
 RED="\e[31m"
 BLUE="\e[34m"
+PURPLE="\e[35m"
 
 function info {
   echo -e "${BLUE}[INFO]${RESET}  $1"
@@ -30,11 +30,166 @@ function warn {
 function error {
   echo -e "${RED}[ERROR]${RESET} $1"
 }
+function enhanced {
+  echo -e "${PURPLE}[ENHANCED]${RESET} $1"
+}
+
+# ─── HUB CONFIGURATION AND DISCOVERY SYSTEM ─────────────────────────────────────
+HUB_ROOT="/srv/hub"
+SERVICE_REGISTRY="$HUB_ROOT/hub-registry.json"
+HUB_CONFIG="$HUB_ROOT/hub-config.json"
+HUB_USER="${HUB_USER:-$USER}"
+
+# Initialize hub metadata for complete discoverability
+function init_hub_metadata {
+  # Create hub configuration file with all metadata
+  cat << EOF | sudo tee "$HUB_CONFIG" >/dev/null
+{
+  "hub_info": {
+    "version": "1.0",
+    "created": "$(date -Iseconds)",
+    "last_updated": "$(date -Iseconds)",
+    "local_ip": "$LOCAL_IP",
+    "hostname": "$(hostname)",
+    "hub_root": "$HUB_ROOT",
+    "backup_root": "/home/$HUB_USER/backups",
+    "user": "$HUB_USER"
+  },
+  "backup_strategy": {
+    "data_paths": ["$HUB_ROOT"],
+    "exclude_patterns": ["*.log", "*.tmp", "cache/*"],
+    "container_handling": "stop_during_backup",
+    "retention_policy": "keep_last_6_monthly"
+  },
+  "network_config": {
+    "firewall_ports": ["53/tcp", "53/udp", "80/tcp", "1883/tcp", "3000/tcp", "3001/tcp", "8081/tcp", "8086/tcp", "8123/tcp", "8201/tcp", "8581/tcp", "9000/tcp", "10443/tcp", "19999/tcp", "32400/tcp"],
+    "internal_dns": "$LOCAL_IP",
+    "mqtt_broker": "localhost:1883"
+  }
+}
+EOF
+  
+  # Create service registry with metadata
+  cat << EOF | sudo tee "$SERVICE_REGISTRY" >/dev/null
+{
+  "registry_info": {
+    "version": "1.0",
+    "created": "$(date -Iseconds)",
+    "discovery_method": "automatic",
+    "backup_compatible": true
+  },
+  "services": []
+}
+EOF
+  
+  sudo chown $HUB_USER:$HUB_USER "$HUB_CONFIG" "$SERVICE_REGISTRY"
+}
+
+function register_service {
+  local name="$1"
+  local data_path="$2"
+  local container_name="$3"
+  local url="$4"
+  local description="$5"
+  local service_type="${6:-general}"
+  local backup_priority="${7:-normal}"
+  
+  # Ensure registry exists
+  [ ! -f "$SERVICE_REGISTRY" ] && init_hub_metadata
+  
+  # Add comprehensive service metadata
+  local service_json=$(cat << EOF
+{
+  "name": "$name",
+  "data_path": "$data_path",
+  "container_name": "$container_name",
+  "url": "$url",
+  "description": "$description",
+  "service_type": "$service_type",
+  "backup_priority": "$backup_priority",
+  "installed": "$(date -Iseconds)",
+  "ports": [],
+  "dependencies": [],
+  "backup_size_estimate": "unknown",
+  "critical": false
+}
+EOF
+)
+  
+  # Add to registry using jq
+  if command -v jq >/dev/null 2>&1; then
+    echo "$service_json" | jq ". as \$new | $(cat "$SERVICE_REGISTRY") | .services += [\$new] | .registry_info.last_updated = \"$(date -Iseconds)\"" > "/tmp/registry.tmp"
+    sudo mv "/tmp/registry.tmp" "$SERVICE_REGISTRY"
+    sudo chown $HUB_USER:$HUB_USER "$SERVICE_REGISTRY"
+  fi
+  
+  # Update hub config with last service addition
+  if command -v jq >/dev/null 2>&1; then
+    jq ".hub_info.last_updated = \"$(date -Iseconds)\" | .hub_info.total_services = (.hub_info.total_services // 0) + 1" "$HUB_CONFIG" > "/tmp/hub-config.tmp"
+    sudo mv "/tmp/hub-config.tmp" "$HUB_CONFIG"
+    sudo chown $HUB_USER:$HUB_USER "$HUB_CONFIG"
+  fi
+}
+
+# Function for backup scripts to discover everything automatically
+function create_discovery_helper {
+  cat << 'EOF' | sudo tee "$HUB_ROOT/discovery-helper.sh" >/dev/null
+#!/usr/bin/env bash
+# Hub Discovery Helper - Used by backup/restore scripts
+# This file is auto-generated and provides complete hub discovery
+
+HUB_ROOT="/srv/hub"
+SERVICE_REGISTRY="$HUB_ROOT/hub-registry.json"
+HUB_CONFIG="$HUB_ROOT/hub-config.json"
+
+# Get all service data paths for backup
+get_all_data_paths() {
+  if [ -f "$SERVICE_REGISTRY" ] && command -v jq >/dev/null 2>&1; then
+    jq -r '.services[].data_path' "$SERVICE_REGISTRY" 2>/dev/null
+  else
+    # Fallback: discover by directory structure
+    find "$HUB_ROOT" -maxdepth 1 -type d -not -name "logs" -not -name "config" | grep -v "^$HUB_ROOT$"
+  fi
+}
+
+# Get all container names for stop/start operations
+get_all_containers() {
+  if [ -f "$SERVICE_REGISTRY" ] && command -v jq >/dev/null 2>&1; then
+    jq -r '.services[].container_name' "$SERVICE_REGISTRY" 2>/dev/null | grep -v "^null$"
+  else
+    # Fallback: get all hub-related containers
+    docker ps -a --format '{{.Names}}' | grep -E "(portainer|watchtower|mosquitto|zigbee2mqtt|homeassistant|scrypted|heimdall|homebridge|plex|influxdb|grafana|pihole|uptime-kuma|netdata)"
+  fi
+}
+
+# Get hub metadata
+get_hub_info() {
+  if [ -f "$HUB_CONFIG" ] && command -v jq >/dev/null 2>&1; then
+    jq -r '.hub_info' "$HUB_CONFIG" 2>/dev/null
+  else
+    echo "{\"version\":\"unknown\",\"backup_root\":\"/home/$USER/backups\",\"user\":\"$USER\"}"
+  fi
+}
+
+# Get critical services (backup priority)
+get_critical_services() {
+  if [ -f "$SERVICE_REGISTRY" ] && command -v jq >/dev/null 2>&1; then
+    jq -r '.services[] | select(.backup_priority == "high" or .critical == true) | .container_name' "$SERVICE_REGISTRY" 2>/dev/null
+  fi
+}
+
+# Export functions for use by backup scripts
+export -f get_all_data_paths get_all_containers get_hub_info get_critical_services
+EOF
+  
+  sudo chmod +x "$HUB_ROOT/discovery-helper.sh"
+  sudo chown $HUB_USER:$HUB_USER "$HUB_ROOT/discovery-helper.sh"
+}
 
 echo
-echo -e "${BLUE}#############################################${RESET}"
-echo -e "${BLUE}# Starting ThinkCentre Hub Setup on Ubuntu #${RESET}"
-echo -e "${BLUE}#############################################${RESET}"
+echo -e "${BLUE}################################################${RESET}"
+echo -e "${BLUE}# Modular Smart Home Hub Setup with Auto-Backup #${RESET}"
+echo -e "${BLUE}################################################${RESET}"
 echo
 
 ### 0) Detect local IPv4 address ###
@@ -57,122 +212,234 @@ sudo apt update && sudo apt upgrade -y
 done_msg "Ubuntu is fully updated."
 echo
 
-info "Installing prerequisites (curl, wget, etc.)…"
-sudo apt install -y curl wget apt-transport-https ca-certificates gnupg lsb-release software-properties-common
-done_msg "Prerequisite packages installed."
+info "Installing prerequisites and monitoring tools…"
+sudo apt install -y curl wget apt-transport-https ca-certificates gnupg lsb-release \
+  software-properties-common htop btop iotop ncdu tree jq fail2ban ufw \
+  smartmontools lm-sensors psmisc net-tools
+done_msg "Essential packages installed."
 echo
 
 ### 2) Install Node.js (v20.x) ###
 info "Installing Node.js 20.x LTS…"
-curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash - >/dev/null
-sudo apt-get install -y nodejs >/dev/null
-NODE_VER="$(node --version 2>/dev/null || echo 'not installed')"
-done_msg "Node.js $NODE_VER installed."
+
+# Check if Node.js is already installed
+if command -v node >/dev/null 2>&1; then
+  NODE_VER="$(node --version 2>/dev/null || echo 'not installed')"
+  info "Node.js $NODE_VER already installed, skipping."
+else
+  # Test DNS resolution first
+  if ! nslookup deb.nodesource.com >/dev/null 2>&1; then
+    warn "DNS resolution issues detected. Trying to fix..."
+    # Temporarily use different DNS
+    echo "nameserver 8.8.8.8" | sudo tee /etc/resolv.conf >/dev/null
+    sleep 2
+  fi
+  
+  if curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash - >/dev/null 2>&1; then
+    sudo apt-get install -y nodejs >/dev/null
+    NODE_VER="$(node --version 2>/dev/null || echo 'not installed')"
+    done_msg "Node.js $NODE_VER installed."
+  else
+    warn "Failed to install Node.js from repository, but continuing..."
+    NODE_VER="installation failed"
+  fi
+fi
 echo
 
 ### 3) Install Docker & Docker Compose Plugin ###
 info "Installing Docker CE + Docker Compose plugin…"
-# Add Docker’s GPG key & repository
-curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --batch --yes --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
-echo \
-  "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] \
-  https://download.docker.com/linux/ubuntu \
-  $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
 
-sudo apt update
-sudo apt install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
-sudo systemctl enable docker
-sudo systemctl start docker
-done_msg "Docker and Docker Compose plugin installed."
+# Check if Docker is already installed
+if command -v docker >/dev/null 2>&1; then
+  info "Docker already installed, ensuring it's running..."
+  sudo systemctl enable docker
+  sudo systemctl start docker
+  done_msg "Docker verified and running."
+else
+  # Test DNS and install Docker
+  if ! nslookup download.docker.com >/dev/null 2>&1; then
+    warn "DNS resolution issues for Docker repository. Trying to fix..."
+    echo "nameserver 8.8.8.8" | sudo tee /etc/resolv.conf >/dev/null
+    sleep 2
+  fi
+  
+  if curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --batch --yes --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg 2>/dev/null; then
+    echo \
+      "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] \
+      https://download.docker.com/linux/ubuntu \
+      $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+    sudo apt update
+    sudo apt install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+    sudo systemctl enable docker
+    sudo systemctl start docker
+    done_msg "Docker and Docker Compose plugin installed."
+  else
+    error "Failed to install Docker due to network issues. Exiting."
+    exit 1
+  fi
+fi
 echo
 
-### 4) Add 'victor' to docker & dialout Groups ###
-info "Adding user 'victor' to docker & dialout groups…"
-sudo usermod -aG docker victor
-sudo usermod -aG dialout victor
-done_msg "'victor' is now in docker & dialout groups."
-warn "You should log out and log back in (or reboot) soon so 'victor' can use Docker without sudo."
+### 4) Add current user to docker & dialout Groups ###
+info "Adding user '$HUB_USER' to docker & dialout groups…"
+sudo usermod -aG docker $HUB_USER
+sudo usermod -aG dialout $HUB_USER
+done_msg "'$HUB_USER' is now in docker & dialout groups."
 echo
 
-### 5) Create /srv/hub Directory Structure ###
-info "Creating /srv/hub directories for configs…"
-sudo mkdir -p /srv/hub/mosquitto/config     && sudo mkdir -p /srv/hub/mosquitto/data
-sudo mkdir -p /srv/hub/zigbee2mqtt/data
-sudo mkdir -p /srv/hub/homeassistant/config
-sudo mkdir -p /srv/hub/homebridge/config
-sudo mkdir -p /srv/hub/scrypted/volume
-sudo mkdir -p /srv/hub/heimdall/config
-sudo mkdir -p /srv/hub/pihole/config     && sudo mkdir -p /srv/hub/pihole/dnsmasq.d
-sudo mkdir -p /srv/hub/plex/config        && sudo mkdir -p /srv/hub/plex/tvseries    && sudo mkdir -p /srv/hub/plex/movies
-sudo mkdir -p /srv/hub/influxdb/config    && sudo mkdir -p /srv/hub/influxdb/data
-sudo mkdir -p /srv/hub/grafana/data
-sudo mkdir -p /srv/hub/uptime/data
-sudo mkdir -p /srv/hub/samba/share
-sudo chown -R victor:victor /srv/hub
-done_msg "/srv/hub structure created."
+### 5) Configure Enhanced Security ###
+enhanced "Configuring enhanced security with UFW and fail2ban…"
+
+# Configure UFW firewall
+sudo ufw --force reset >/dev/null 2>&1
+sudo ufw default deny incoming
+sudo ufw default allow outgoing
+sudo ufw allow ssh
+
+# Allow specific service ports
+declare -a PORTS=(
+  "53/tcp" "53/udp" "80/tcp" "1883/tcp" "3000/tcp" "3001/tcp" 
+  "8081/tcp" "8086/tcp" "8123/tcp" "8201/tcp" "8581/tcp" 
+  "9000/tcp" "10443/tcp" "19999/tcp" "32400/tcp"
+)
+
+for port in "${PORTS[@]}"; do
+  sudo ufw allow "$port" >/dev/null
+done
+
+sudo ufw --force enable
+sudo systemctl enable fail2ban
+sudo systemctl start fail2ban
+done_msg "Security configured: UFW firewall + fail2ban enabled."
 echo
 
-### 6) Deploy Portainer ###
-info "Deploying Portainer (Docker GUI)…"
-if sudo docker ps -a --format '{{.Names}}' | grep -qw portainer; then
-  done_msg "Portainer container already exists, skipping."
+### 6) Configure System Monitoring ###
+enhanced "Setting up hardware monitoring…"
+sudo sensors-detect --auto >/dev/null 2>&1 || true
+
+# Enable SMART monitoring (handle different service names)
+if systemctl list-unit-files | grep -q "^smartmontools.service"; then
+  sudo systemctl enable smartmontools
+  sudo systemctl start smartmontools
+elif systemctl list-unit-files | grep -q "^smartd.service"; then
+  sudo systemctl enable smartd >/dev/null 2>&1 || true
+  sudo systemctl start smartd >/dev/null 2>&1 || true
+else
+  warn "SMART monitoring service not found, but smartmontools package is installed"
+fi
+
+done_msg "Hardware monitoring configured."
+echo
+
+### 7) Create Self-Discovering Hub Structure ###
+info "Creating self-discovering modular hub structure…"
+
+# Core hub directories with standardized layout
+sudo mkdir -p "$HUB_ROOT"/{logs,config,scripts}
+sudo mkdir -p /home/$HUB_USER/backups
+
+# Initialize hub metadata and discovery system
+init_hub_metadata
+create_discovery_helper
+
+# Set proper ownership
+sudo chown -R $HUB_USER:$HUB_USER "$HUB_ROOT"
+sudo chown -R $HUB_USER:$HUB_USER /home/$HUB_USER/backups
+
+done_msg "Self-discovering hub structure created with full metadata."
+echo
+
+### 8) Deploy Portainer ###
+enhanced "Deploying Portainer (Docker Management)…"
+SERVICE_NAME="portainer"
+DATA_DIR="$HUB_ROOT/$SERVICE_NAME"
+sudo mkdir -p "$DATA_DIR/data"
+sudo chown -R $HUB_USER:$HUB_USER "$DATA_DIR"
+
+if sudo docker ps -a --format '{{.Names}}' | grep -qw "$SERVICE_NAME"; then
+  done_msg "$SERVICE_NAME container already exists, skipping."
 else
   sudo docker run -d \
-    -p 9000:9000 \
-    --name=portainer \
-    --restart unless-stopped \
+    -p 9000:9000 -p 9443:9443 \
+    --name="$SERVICE_NAME" --restart unless-stopped \
     -v /var/run/docker.sock:/var/run/docker.sock \
-    -v portainer_data:/data \
+    -v "$DATA_DIR/data":/data \
     portainer/portainer-ce:latest
-  done_msg "Portainer is running at http://$LOCAL_IP:9000"
+  done_msg "$SERVICE_NAME deployed"
 fi
+
+register_service "$SERVICE_NAME" "$DATA_DIR" "$SERVICE_NAME" "http://$LOCAL_IP:9000" "Docker Management Interface" "management" "high"
 echo
 
-### 7) Deploy Watchtower (Auto-update Containers) ###
-info "Deploying Watchtower…"
-if sudo docker ps -a --format '{{.Names}}' | grep -qw watchtower; then
-  done_msg "Watchtower container already exists, skipping."
+### 9) Deploy Watchtower ###
+enhanced "Deploying Watchtower (Container Auto-updater)…"
+SERVICE_NAME="watchtower"
+DATA_DIR="$HUB_ROOT/$SERVICE_NAME"
+sudo mkdir -p "$DATA_DIR/config"
+sudo chown -R $HUB_USER:$HUB_USER "$DATA_DIR"
+
+if sudo docker ps -a --format '{{.Names}}' | grep -qw "$SERVICE_NAME"; then
+  done_msg "$SERVICE_NAME container already exists, skipping."
 else
   sudo docker run -d \
-    --name=watchtower \
-    --restart unless-stopped \
+    --name="$SERVICE_NAME" --restart unless-stopped \
     -v /var/run/docker.sock:/var/run/docker.sock \
-    containrrr/watchtower \
-    --cleanup \
-    --interval 300
-  done_msg "Watchtower is running (checks every 5 minutes)."
+    -v "$DATA_DIR/config":/config \
+    -e WATCHTOWER_CLEANUP=true \
+    -e WATCHTOWER_ROLLING_RESTART=true \
+    containrrr/watchtower --interval 3600
+  done_msg "$SERVICE_NAME deployed"
 fi
+
+register_service "$SERVICE_NAME" "$DATA_DIR" "$SERVICE_NAME" "N/A" "Container Auto-updater" "automation" "normal"
 echo
 
-### 8) Deploy Mosquitto (MQTT Broker) ###
-info "Deploying Mosquitto (MQTT Broker)…"
-if sudo docker ps -a --format '{{.Names}}' | grep -qw mosquitto; then
-  done_msg "Mosquitto container already exists, skipping."
+### 10) Deploy Mosquitto ###
+enhanced "Deploying Mosquitto (MQTT Broker)…"
+SERVICE_NAME="mosquitto"
+DATA_DIR="$HUB_ROOT/$SERVICE_NAME"
+sudo mkdir -p "$DATA_DIR"/{config,data}
+sudo chown -R $HUB_USER:$HUB_USER "$DATA_DIR"
+
+if sudo docker ps -a --format '{{.Names}}' | grep -qw "$SERVICE_NAME"; then
+  done_msg "$SERVICE_NAME container already exists, skipping."
 else
-  if [ ! -f /srv/hub/mosquitto/config/mosquitto.conf ]; then
-    cat << 'EOF' | sudo tee /srv/hub/mosquitto/config/mosquitto.conf >/dev/null
-# Mosquitto MQTT broker config (anonymous, persistent)
+  # Create config if it doesn't exist
+  if [ ! -f "$DATA_DIR/config/mosquitto.conf" ]; then
+    cat << 'EOF' | sudo tee "$DATA_DIR/config/mosquitto.conf" >/dev/null
 listener 1883
 allow_anonymous true
 persistence true
 persistence_location /mosquitto/data/
-log_dest stdout
+log_dest file /mosquitto/data/mosquitto.log
+log_type all
+connection_messages true
+log_timestamp true
 EOF
+    sudo chown $HUB_USER:$HUB_USER "$DATA_DIR/config/mosquitto.conf"
   fi
 
   sudo docker run -d \
-    --name mosquitto \
-    --restart unless-stopped \
+    --name="$SERVICE_NAME" --restart unless-stopped \
     -p 1883:1883 \
-    -v /srv/hub/mosquitto/config/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro \
-    -v /srv/hub/mosquitto/data:/mosquitto/data \
+    -v "$DATA_DIR/config/mosquitto.conf":/mosquitto/config/mosquitto.conf:ro \
+    -v "$DATA_DIR/data":/mosquitto/data \
     eclipse-mosquitto:latest
-  done_msg "Mosquitto MQTT is running on port 1883."
+  done_msg "$SERVICE_NAME deployed"
 fi
+
+register_service "$SERVICE_NAME" "$DATA_DIR" "$SERVICE_NAME" "mqtt://$LOCAL_IP:1883" "MQTT Message Broker" "communication" "high"
 echo
 
-### 9) Deploy Zigbee2MQTT (only if a Zigbee adapter exists) ###
-info "Deploying Zigbee2MQTT…"
+### 11) Deploy Zigbee2MQTT ###
+enhanced "Deploying Zigbee2MQTT (if adapter present)…"
+SERVICE_NAME="zigbee2mqtt"
+DATA_DIR="$HUB_ROOT/$SERVICE_NAME"
+sudo mkdir -p "$DATA_DIR/data"
+sudo chown -R $HUB_USER:$HUB_USER "$DATA_DIR"
+
+# Check for Zigbee adapter
 ZIGBEE_DEVICE=""
 if [ -e /dev/ttyACM0 ]; then
   ZIGBEE_DEVICE="/dev/ttyACM0"
@@ -181,149 +448,181 @@ elif [ -e /dev/ttyUSB0 ]; then
 fi
 
 if [ -z "$ZIGBEE_DEVICE" ]; then
-  warn "No Zigbee adapter detected at /dev/ttyACM0 or /dev/ttyUSB0. Skipping Zigbee2MQTT."
+  warn "No Zigbee adapter detected. Skipping $SERVICE_NAME."
 else
-  if sudo docker ps -a --format '{{.Names}}' | grep -qw zigbee2mqtt; then
-    done_msg "Zigbee2MQTT container already exists, skipping."
+  if sudo docker ps -a --format '{{.Names}}' | grep -qw "$SERVICE_NAME"; then
+    done_msg "$SERVICE_NAME container already exists, skipping."
   else
-    if [ ! -f /srv/hub/zigbee2mqtt/data/configuration.yaml ]; then
-      cat << 'EOF' | sudo tee /srv/hub/zigbee2mqtt/data/configuration.yaml >/dev/null
-homeassistant: false
-permit_join: true
+    # Create config if it doesn't exist
+    if [ ! -f "$DATA_DIR/data/configuration.yaml" ]; then
+      cat << EOF | sudo tee "$DATA_DIR/data/configuration.yaml" >/dev/null
+homeassistant: true
+permit_join: false
 mqtt:
   base_topic: zigbee2mqtt
   server: 'mqtt://localhost:1883'
-  user: ''
-  password: ''
 serial:
-  port: 'ZIGBEE_PORT_PLACEHOLDER'
+  port: '$ZIGBEE_DEVICE'
+  adapter: auto
+advanced:
+  log_level: info
+  pan_id: GENERATE
+  network_key: GENERATE
+frontend:
+  port: 8081
+  host: 0.0.0.0
 devices: []
+groups: []
 EOF
-      sudo sed -i "s|ZIGBEE_PORT_PLACEHOLDER|$ZIGBEE_DEVICE|" /srv/hub/zigbee2mqtt/data/configuration.yaml
+      sudo chown $HUB_USER:$HUB_USER "$DATA_DIR/data/configuration.yaml"
     fi
 
     sudo docker run -d \
-      --name zigbee2mqtt \
-      --restart unless-stopped \
-      --device="$ZIGBEE_DEVICE" \
-      --net=host \
-      -v /srv/hub/zigbee2mqtt/data:/app/data \
+      --name="$SERVICE_NAME" --restart unless-stopped \
+      --device="$ZIGBEE_DEVICE" --net=host \
+      -v "$DATA_DIR/data":/app/data \
       -v /run/udev:/run/udev:ro \
       -e TZ="$(timedatectl show --value --property=Timezone)" \
       koenkk/zigbee2mqtt:latest
-    done_msg "Zigbee2MQTT is running (UI at http://$LOCAL_IP:8081)."
+    done_msg "$SERVICE_NAME deployed"
   fi
+
+  register_service "$SERVICE_NAME" "$DATA_DIR" "$SERVICE_NAME" "http://$LOCAL_IP:8081" "Zigbee Device Manager" "smart_home" "high"
 fi
 echo
 
-### 10) Deploy Scrypted ###
-info "Deploying Scrypted (Camera/Doorbell Hub)…"
-if sudo docker ps -a --format '{{.Names}}' | grep -qw scrypted; then
-  done_msg "Scrypted container already exists, skipping."
+### 12) Deploy Home Assistant ###
+enhanced "Deploying Home Assistant (Home Automation)…"
+SERVICE_NAME="homeassistant"
+DATA_DIR="$HUB_ROOT/$SERVICE_NAME"
+sudo mkdir -p "$DATA_DIR/config"
+sudo chown -R $HUB_USER:$HUB_USER "$DATA_DIR"
+
+if sudo docker ps -a --format '{{.Names}}' | grep -qw "$SERVICE_NAME"; then
+  done_msg "$SERVICE_NAME container already exists, skipping."
 else
   sudo docker run -d \
-    --name scrypted \
-    --restart unless-stopped \
+    --name="$SERVICE_NAME" --restart unless-stopped \
+    -v "$DATA_DIR/config":/config \
+    -v /etc/localtime:/etc/localtime:ro \
+    --privileged --network host \
+    ghcr.io/home-assistant/home-assistant:stable
+  done_msg "$SERVICE_NAME deployed"
+fi
+
+register_service "$SERVICE_NAME" "$DATA_DIR" "$SERVICE_NAME" "http://$LOCAL_IP:8123" "Home Automation Platform" "smart_home" "critical"
+echo
+
+### 13) Deploy Scrypted ###
+enhanced "Deploying Scrypted (Camera/Security Hub)…"
+SERVICE_NAME="scrypted"
+DATA_DIR="$HUB_ROOT/$SERVICE_NAME"
+sudo mkdir -p "$DATA_DIR/volume"
+sudo chown -R $HUB_USER:$HUB_USER "$DATA_DIR"
+
+if sudo docker ps -a --format '{{.Names}}' | grep -qw "$SERVICE_NAME"; then
+  done_msg "$SERVICE_NAME container already exists, skipping."
+else
+  sudo docker run -d \
+    --name="$SERVICE_NAME" --restart unless-stopped \
     --network host \
-    -v /srv/hub/scrypted/volume:/server/volume \
+    -v "$DATA_DIR/volume":/server/volume \
     koush/scrypted:latest
-  done_msg "Scrypted is running (UI at https://$LOCAL_IP:10443)."
+  done_msg "$SERVICE_NAME deployed"
 fi
+
+register_service "$SERVICE_NAME" "$DATA_DIR" "$SERVICE_NAME" "https://$LOCAL_IP:10443" "Camera & Security Management" "security" "normal"
 echo
 
-### 11) Deploy Heimdall ###
-info "Deploying Heimdall (Dashboard)…"
-if sudo docker ps -a --format '{{.Names}}' | grep -qw heimdall; then
-  done_msg "Heimdall container already exists, skipping."
+### 14) Deploy Heimdall ###
+enhanced "Deploying Heimdall (Service Dashboard)…"
+SERVICE_NAME="heimdall"
+DATA_DIR="$HUB_ROOT/$SERVICE_NAME"
+sudo mkdir -p "$DATA_DIR/config"
+sudo chown -R $HUB_USER:$HUB_USER "$DATA_DIR"
+
+if sudo docker ps -a --format '{{.Names}}' | grep -qw "$SERVICE_NAME"; then
+  done_msg "$SERVICE_NAME container already exists, skipping."
 else
   sudo docker run -d \
-    --name heimdall \
-    --restart unless-stopped \
-    -e PUID=1000 \
-    -e PGID=1000 \
-    -v /srv/hub/heimdall/config:/config \
+    --name="$SERVICE_NAME" --restart unless-stopped \
+    -e PUID=1000 -e PGID=1000 \
+    -v "$DATA_DIR/config":/config \
     -p 8201:80 \
     linuxserver/heimdall:latest
-  done_msg "Heimdall is running (UI at http://$LOCAL_IP:8201)."
+  done_msg "$SERVICE_NAME deployed"
 fi
+
+register_service "$SERVICE_NAME" "$DATA_DIR" "$SERVICE_NAME" "http://$LOCAL_IP:8201" "Service Dashboard" "management" "normal"
 echo
 
-### 12) Deploy Homebridge ###
-info "Deploying Homebridge (HomeKit Bridge)…"
-if sudo docker ps -a --format '{{.Names}}' | grep -qw homebridge; then
-  done_msg "Homebridge container already exists, skipping."
+### 15) Deploy Homebridge ###
+enhanced "Deploying Homebridge (HomeKit Bridge)…"
+SERVICE_NAME="homebridge"
+DATA_DIR="$HUB_ROOT/$SERVICE_NAME"
+sudo mkdir -p "$DATA_DIR/config"
+sudo chown -R $HUB_USER:$HUB_USER "$DATA_DIR"
+
+if sudo docker ps -a --format '{{.Names}}' | grep -qw "$SERVICE_NAME"; then
+  done_msg "$SERVICE_NAME container already exists, skipping."
 else
   sudo docker run -d \
-    --name homebridge \
-    --restart unless-stopped \
+    --name="$SERVICE_NAME" --restart unless-stopped \
     --network host \
-    -e PUID=1000 \
-    -e PGID=1000 \
+    -e PUID=1000 -e PGID=1000 \
     -e TZ="$(timedatectl show --value --property=Timezone)" \
     -e HOMEBRIDGE_CONFIG_UI=1 \
     -e HOMEBRIDGE_CONFIG_UI_PORT=8581 \
-    -v /srv/hub/homebridge/config:/homebridge \
+    -v "$DATA_DIR/config":/homebridge \
     oznu/homebridge:latest
-  done_msg "Homebridge is running (UI at http://$LOCAL_IP:8581)."
+  done_msg "$SERVICE_NAME deployed"
 fi
+
+register_service "$SERVICE_NAME" "$DATA_DIR" "$SERVICE_NAME" "http://$LOCAL_IP:8581" "Apple HomeKit Bridge" "smart_home" "normal"
 echo
 
-### 13) Deploy Home Assistant (Container) ###
-info "Deploying Home Assistant (Home Automation)…"
-if sudo docker ps -a --format '{{.Names}}' | grep -qw homeassistant; then
-  done_msg "Home Assistant container already exists, skipping."
-else
-  sudo docker run -d \
-    --name homeassistant \
-    --restart unless-stopped \
-    -v /srv/hub/homeassistant/config:/config \
-    --privileged \
-    --network host \
-    ghcr.io/home-assistant/home-assistant:stable
-  done_msg "Home Assistant is running (UI at http://$LOCAL_IP:8123)."
-fi
-echo
+### 16) Deploy Plex ###
+enhanced "Deploying Plex Media Server…"
+SERVICE_NAME="plex"
+DATA_DIR="$HUB_ROOT/$SERVICE_NAME"
+sudo mkdir -p "$DATA_DIR"/{config,media/tvseries,media/movies}
+sudo chown -R $HUB_USER:$HUB_USER "$DATA_DIR"
 
-### 14) Deploy Plex Media Server ###
-info "Deploying Plex Media Server…"
-if sudo docker ps -a --format '{{.Names}}' | grep -qw plex; then
-  done_msg "Plex container already exists, skipping."
+if sudo docker ps -a --format '{{.Names}}' | grep -qw "$SERVICE_NAME"; then
+  done_msg "$SERVICE_NAME container already exists, skipping."
 else
   sudo docker run -d \
-    --name plex \
-    --restart unless-stopped \
-    -e PUID=1000 \
-    -e PGID=1000 \
+    --name="$SERVICE_NAME" --restart unless-stopped \
+    -e PUID=1000 -e PGID=1000 \
     -e TZ="$(timedatectl show --value --property=Timezone)" \
-    -e PLEX_CLAIM="" \
-    -v /srv/hub/plex/config:/config \
-    -v /srv/hub/plex/tvseries:/data/tvshows \
-    -v /srv/hub/plex/movies:/data/movies \
+    -v "$DATA_DIR/config":/config \
+    -v "$DATA_DIR/media/tvseries":/data/tvshows \
+    -v "$DATA_DIR/media/movies":/data/movies \
     -p 32400:32400 \
     linuxserver/plex:latest
-  done_msg "Plex Media Server is running (UI at http://$LOCAL_IP:32400)."
+  done_msg "$SERVICE_NAME deployed"
 fi
+
+register_service "$SERVICE_NAME" "$DATA_DIR" "$SERVICE_NAME" "http://$LOCAL_IP:32400" "Media Streaming Server" "media" "normal"
 echo
-### 15) Deploy InfluxDB (with admin/admin setup) ###
-info "Deploying InfluxDB (Time-series database)…"
 
-# 15a) Remove any existing influxdb container
-if sudo docker ps -a --format '{{.Names}}' | grep -qw influxdb; then
-  warn "Removing old InfluxDB container..."
-  sudo docker stop influxdb >/dev/null 2>&1 || true
-  sudo docker rm influxdb >/dev/null 2>&1 || true
-  done_msg "Old InfluxDB container removed."
+### 17) Deploy InfluxDB ###
+enhanced "Deploying InfluxDB (Time-series Database)…"
+SERVICE_NAME="influxdb"
+DATA_DIR="$HUB_ROOT/$SERVICE_NAME"
+sudo mkdir -p "$DATA_DIR"/{config,data}
+sudo chown -R 1000:1000 "$DATA_DIR"
+
+if sudo docker ps -a --format '{{.Names}}' | grep -qw "$SERVICE_NAME"; then
+  warn "Removing old $SERVICE_NAME container..."
+  sudo docker stop "$SERVICE_NAME" >/dev/null 2>&1 || true
+  sudo docker rm "$SERVICE_NAME" >/dev/null 2>&1 || true
 fi
 
-# 15b) Ensure proper ownership of InfluxDB directories
-sudo chown -R 1000:1000 /srv/hub/influxdb/config /srv/hub/influxdb/data
-
-# 15c) Run InfluxDB in setup mode with predefined credentials
 sudo docker run -d \
-  --name influxdb \
-  --restart unless-stopped \
-  -v /srv/hub/influxdb/config:/etc/influxdb2 \
-  -v /srv/hub/influxdb/data:/var/lib/influxdb2 \
+  --name="$SERVICE_NAME" --restart unless-stopped \
+  -v "$DATA_DIR/config":/etc/influxdb2 \
+  -v "$DATA_DIR/data":/var/lib/influxdb2 \
   -p 8086:8086 \
   -e DOCKER_INFLUXDB_INIT_MODE=setup \
   -e DOCKER_INFLUXDB_INIT_USERNAME=admin \
@@ -333,253 +632,228 @@ sudo docker run -d \
   -e DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=my-super-secret-auth-token \
   influxdb:2
 
-# 15d) Wait for InfluxDB to be ready
-info "Waiting for InfluxDB to start up..."
 sleep 10
-for i in {1..30}; do
-  if sudo docker logs influxdb 2>&1 | grep -q "Listening"; then
-    done_msg "InfluxDB is ready!"
-    break
-  fi
-  if [ $i -eq 30 ]; then
-    error "InfluxDB failed to start properly. Check logs with: docker logs influxdb"
-    break
-  fi
-  sleep 2
-done
+done_msg "$SERVICE_NAME deployed"
 
-done_msg "InfluxDB is running (UI at http://$LOCAL_IP:8086) with user admin/adminpassword."
-
-### 16) Deploy Grafana ###
-info "Deploying Grafana (Metrics & Dashboards)…"
-if sudo docker ps -a --format '{{.Names}}' | grep -qw grafana; then
-  done_msg "Grafana container already exists, skipping."
-else
-  sudo docker run -d \
-    --name grafana \
-    --restart unless-stopped \
-    -v /srv/hub/grafana/data:/var/lib/grafana \
-    -p 3000:3000 \
-    grafana/grafana:latest
-  done_msg "Grafana is running (UI at http://$LOCAL_IP:3000)."
-fi
+register_service "$SERVICE_NAME" "$DATA_DIR" "$SERVICE_NAME" "http://$LOCAL_IP:8086" "Time-series Database (admin/adminpassword)" "database" "high"
 echo
 
-### 17) Deploy Pi-hole (Network-wide Ad Blocker) ###
-info "Deploying Pi-hole (Network-wide Ad Blocker)…"
+### 18) Deploy Grafana ###
+enhanced "Deploying Grafana (Analytics Dashboard)…"
+SERVICE_NAME="grafana"
+DATA_DIR="$HUB_ROOT/$SERVICE_NAME"
+sudo mkdir -p "$DATA_DIR/data"
+sudo chown -R $HUB_USER:$HUB_USER "$DATA_DIR"
 
-# 17a) Disable & stop systemd-resolved so nothing else holds port 53
+if sudo docker ps -a --format '{{.Names}}' | grep -qw "$SERVICE_NAME"; then
+  done_msg "$SERVICE_NAME container already exists, skipping."
+else
+  sudo docker run -d \
+    --name="$SERVICE_NAME" --restart unless-stopped \
+    -v "$DATA_DIR/data":/var/lib/grafana \
+    -e GF_SECURITY_ADMIN_USER=admin \
+    -e GF_SECURITY_ADMIN_PASSWORD=admin \
+    -e GF_USERS_ALLOW_SIGN_UP=false \
+    -p 3000:3000 \
+    grafana/grafana:latest
+  done_msg "$SERVICE_NAME deployed"
+fi
+
+register_service "$SERVICE_NAME" "$DATA_DIR" "$SERVICE_NAME" "http://$LOCAL_IP:3000" "Analytics Dashboard (admin/admin)" "monitoring" "normal"
+echo
+
+### 19) Deploy Pi-hole ###
+enhanced "Deploying Pi-hole (Network Ad Blocker)…"
+SERVICE_NAME="pihole"
+DATA_DIR="$HUB_ROOT/$SERVICE_NAME"
+sudo mkdir -p "$DATA_DIR"/{config,dnsmasq.d}
+sudo chown -R $HUB_USER:$HUB_USER "$DATA_DIR"
+
+# Disable systemd-resolved for port 53
 if systemctl is-active --quiet systemd-resolved; then
-  warn "Stopping and disabling systemd-resolved so Pi-hole can bind to port 53..."
+  warn "Disabling systemd-resolved for Pi-hole..."
   sudo systemctl disable --now systemd-resolved
   sudo rm -f /etc/resolv.conf
   echo "nameserver 1.1.1.1" | sudo tee /etc/resolv.conf >/dev/null
-  done_msg "systemd-resolved disabled; /etc/resolv.conf now set to 1.1.1.1"
 fi
 
-# 17b) Stop & remove any existing Pi-hole container, to force re-creation
-if sudo docker ps -a --format '{{.Names}}' | grep -qw pihole; then
-  warn "Stopping and removing old Pi-hole container..."
-  sudo docker stop pihole >/dev/null 2>&1 || true
-  sudo docker rm pihole   >/dev/null 2>&1 || true
-  done_msg "Old Pi-hole container removed."
+# Remove existing container
+if sudo docker ps -a --format '{{.Names}}' | grep -qw "$SERVICE_NAME"; then
+  sudo docker stop "$SERVICE_NAME" >/dev/null 2>&1 || true
+  sudo docker rm "$SERVICE_NAME" >/dev/null 2>&1 || true
 fi
 
-# 17c) Ensure port 53 is free on the host
-if ss -ltn | grep -q ':53 '; then
-  error "Port 53 is still in use on the host. Cannot start Pi-hole."
-else
-  info "Port 53 is free. Creating new Pi-hole container..."
-  sudo docker run -d \
-    --name pihole \
-    --restart unless-stopped \
-    -e TZ="$(timedatectl show --value --property=Timezone)" \
-    -e WEBPASSWORD="changeme" \
-    -v /srv/hub/pihole/config:/etc/pihole \
-    -v /srv/hub/pihole/dnsmasq.d:/etc/dnsmasq.d \
-    -p 53:53/tcp -p 53:53/udp \
-    -p 80:80 \
-    pihole/pihole:latest >/dev/null
+sudo docker run -d \
+  --name="$SERVICE_NAME" --restart unless-stopped \
+  -e TZ="$(timedatectl show --value --property=Timezone)" \
+  -e WEBPASSWORD="changeme" \
+  -e PIHOLE_DNS_="1.1.1.1;8.8.8.8" \
+  -v "$DATA_DIR/config":/etc/pihole \
+  -v "$DATA_DIR/dnsmasq.d":/etc/dnsmasq.d \
+  -p 53:53/tcp -p 53:53/udp -p 80:80 \
+  pihole/pihole:latest >/dev/null
 
-  done_msg "Pi-hole container created; waiting for it to start listening on port 53…"
+sleep 5
+done_msg "$SERVICE_NAME deployed"
 
-  # 17d) Wait up to 30 seconds for Pi-hole to bind to port 53
-  SECONDS=0
-  while (( SECONDS < 30 )); do
-    if ss -ltn | grep -q ':53 ' && ss -lnup | grep -q ':53 '; then
-      done_msg "Pi-hole is now listening on port 53."
-      break
-    fi
-    sleep 1
-  done
-
-  if (( SECONDS >= 30 )); then
-    error "Timed out waiting for Pi-hole to bind to port 53. Check 'docker logs pihole' for details."
-  fi
-fi
+register_service "$SERVICE_NAME" "$DATA_DIR" "$SERVICE_NAME" "http://$LOCAL_IP/admin" "Network Ad Blocker (password: changeme)" "network" "critical"
 echo
 
-### 18) Deploy Uptime Kuma ###
-info "Deploying Uptime Kuma (Self-hosted monitoring)…"
-if sudo docker ps -a --format '{{.Names}}' | grep -qw uptime-kuma; then
-  done_msg "Uptime Kuma container already exists, skipping."
+### 20) Deploy Uptime Kuma ###
+enhanced "Deploying Uptime Kuma (Service Monitoring)…"
+SERVICE_NAME="uptime-kuma"
+DATA_DIR="$HUB_ROOT/$SERVICE_NAME"
+sudo mkdir -p "$DATA_DIR/data"
+sudo chown -R $HUB_USER:$HUB_USER "$DATA_DIR"
+
+if sudo docker ps -a --format '{{.Names}}' | grep -qw "$SERVICE_NAME"; then
+  done_msg "$SERVICE_NAME container already exists, skipping."
 else
   sudo docker run -d \
-    --name uptime-kuma \
-    --restart unless-stopped \
-    -v /srv/hub/uptime/data:/app/data \
+    --name="$SERVICE_NAME" --restart unless-stopped \
+    -v "$DATA_DIR/data":/app/data \
     -p 3001:3001 \
     louislam/uptime-kuma:latest
-  done_msg "Uptime Kuma is running (UI at http://$LOCAL_IP:3001)."
+  done_msg "$SERVICE_NAME deployed"
 fi
+
+register_service "$SERVICE_NAME" "$DATA_DIR" "$SERVICE_NAME" "http://$LOCAL_IP:3001" "Service Uptime Monitor" "monitoring" "normal"
 echo
 
-### 19) Deploy Netdata (Real-Time System Monitoring) ###
-info "Deploying Netdata (real-time system monitoring)…"
-if sudo docker ps -a --format '{{.Names}}' | grep -qw netdata; then
-  done_msg "Netdata container already exists, skipping."
+### 21) Deploy Netdata ###
+enhanced "Deploying Netdata (System Monitoring)…"
+SERVICE_NAME="netdata"
+DATA_DIR="$HUB_ROOT/$SERVICE_NAME"
+sudo mkdir -p "$DATA_DIR"/{lib,cache}
+sudo chown -R $HUB_USER:$HUB_USER "$DATA_DIR"
+
+if sudo docker ps -a --format '{{.Names}}' | grep -qw "$SERVICE_NAME"; then
+  done_msg "$SERVICE_NAME container already exists, skipping."
 else
   sudo docker run -d \
-    --name netdata \
-    --cap-add SYS_PTRACE \
-    --cap-add SYS_NICE \
-    --restart unless-stopped \
+    --name="$SERVICE_NAME" --restart unless-stopped \
+    --cap-add SYS_PTRACE --cap-add SYS_NICE \
     -p 19999:19999 \
-    -v netdata_lib:/var/lib/netdata \
-    -v netdata_cache:/var/cache/netdata \
+    -v "$DATA_DIR/lib":/var/lib/netdata \
+    -v "$DATA_DIR/cache":/var/cache/netdata \
     -v /etc/passwd:/host/etc/passwd:ro \
     -v /etc/group:/host/etc/group:ro \
     -v /proc:/host/proc:ro \
     -v /sys:/host/sys:ro \
     -v /etc/os-release:/host/etc/os-release:ro \
+    -v /var/run/docker.sock:/var/run/docker.sock:ro \
     netdata/netdata:latest
-  done_msg "Netdata is running (UI at http://$LOCAL_IP:19999)."
+  done_msg "$SERVICE_NAME deployed"
 fi
+
+register_service "$SERVICE_NAME" "$DATA_DIR" "$SERVICE_NAME" "http://$LOCAL_IP:19999" "Real-time System Monitor" "monitoring" "normal"
 echo
 
-### 20) Create Backup Script for /srv/hub ###
-info "Creating /home/victor/backup-hub.sh for monthly backups…"
-BACKUP_SCRIPT="/home/victor/backup-hub.sh"
+### 22) Finalize Discovery System ###
+enhanced "Finalizing self-discovery system for future services…"
 
-cat << 'EOF' > "$BACKUP_SCRIPT"
+# Create template for adding new services
+cat << 'EOF' | sudo tee "$HUB_ROOT/add-service-template.sh" >/dev/null
 #!/usr/bin/env bash
-#
-# backup-hub.sh  —  Create a timestamped tarball of /srv/hub
-# Usage: /home/victor/backup-hub.sh
-#
+# Template for adding new services to the hub
+# Usage: Copy this template and modify for your service
 
-set -euo pipefail
+# Example: Adding WireGuard VPN
+SERVICE_NAME="wireguard"
+DATA_DIR="$HUB_ROOT/$SERVICE_NAME"
+sudo mkdir -p "$DATA_DIR/config"
+sudo chown -R $HUB_USER:$HUB_USER "$DATA_DIR"
 
-# Colors for interactive readability
-RESET="\e[0m"
-GREEN="\e[32m"
-BLUE="\e[34m"
+# Deploy container (modify as needed)
+sudo docker run -d \
+  --name="$SERVICE_NAME" --restart unless-stopped \
+  --cap-add=NET_ADMIN \
+  -p 51820:51820/udp \
+  -v "$DATA_DIR/config":/config \
+  -e PUID=1000 -e PGID=1000 \
+  linuxserver/wireguard:latest
 
-function info {
-  echo -e "${BLUE}[INFO]${RESET}  $1"
-}
-function done_msg {
-  echo -e "${GREEN}[DONE]${RESET}  $1"
-}
-
-TIMESTAMP="$(date +%F_%H%M)"
-DEST_DIR="/home/victor/backups"
-ARCHIVE_NAME="hub-backup-$TIMESTAMP.tar.gz"
-DEST_PATH="$DEST_DIR/$ARCHIVE_NAME"
-
-info "Ensuring $DEST_DIR exists..."
-mkdir -p "$DEST_DIR"
-
-info "Packaging /srv/hub → $DEST_PATH ..."
-sudo tar czf "$DEST_PATH" -C /srv hub
-
-done_msg "Backup complete: $ARCHIVE_NAME"
+# Register service (REQUIRED - this makes it discoverable by backup/restore)
+register_service "$SERVICE_NAME" "$DATA_DIR" "$SERVICE_NAME" "vpn://$LOCAL_IP:51820" "WireGuard VPN Server" "network" "high"
 EOF
 
-chmod +x "$BACKUP_SCRIPT"
-done_msg "Backup script created at $BACKUP_SCRIPT"
+sudo chown $HUB_USER:$HUB_USER "$HUB_ROOT/add-service-template.sh"
+chmod +x "$HUB_ROOT/add-service-template.sh"
+
+done_msg "Complete discovery system ready:"
+echo "  • Service registry: $SERVICE_REGISTRY" 
+echo "  • Hub config: $HUB_CONFIG"
+echo "  • Discovery helper: $HUB_ROOT/discovery-helper.sh"
+echo "  • Service template: $HUB_ROOT/add-service-template.sh"
 echo
 
-### 21) Schedule Monthly Cron Job for Backup ###
-info "Scheduling monthly backup via cron (02:00 AM on day 1)…"
-CRON_BACKUP_FILE="/etc/cron.d/hub-backup"
-sudo bash -c "cat << 'CRON_EOF' > $CRON_BACKUP_FILE
-# Run backup-hub.sh at 02:00 on the 1st of every month as user 'victor'
-0 2 1 * * victor /home/victor/backup-hub.sh >/dev/null 2>&1
-CRON_EOF"
-sudo chmod 644 "$CRON_BACKUP_FILE"
-done_msg "Cron job written to $CRON_BACKUP_FILE"
+### 23) Schedule Monthly Backup ###
+enhanced "Scheduling automated backup…"
+sudo bash -c "echo \"0 2 1 * * $HUB_USER /home/$HUB_USER/backup-hub.sh >> /home/$HUB_USER/backups/backup.log 2>&1\" > /etc/cron.d/hub-backup"
+sudo chmod 644 /etc/cron.d/hub-backup
+done_msg "Monthly backup scheduled for 2AM on 1st of each month"
 echo
 
-### 22) Schedule Monthly Cron Job for Self-Healing Script ###
-info "Scheduling monthly self-healing script via cron (03:00 AM on day 2)…"
-CRON_SELFHEAL_FILE="/etc/cron.d/monthly-self-healing"
-SCRIPT_PATH="/home/victor/scripts/nuc-hub.sh"
-
-sudo bash -c "cat << 'CRON2_EOF' > $CRON_SELFHEAL_FILE
-# Run nuc-hub.sh at 03:00 on the 2nd of every month as user 'victor'
-0 3 2 * * victor $SCRIPT_PATH >/dev/null 2>&1
-CRON2_EOF"
-sudo chmod 644 "$CRON_SELFHEAL_FILE"
-done_msg "Cron job written to $CRON_SELFHEAL_FILE"
-echo
-
-### 23) Install & Configure Unattended-Upgrades ###
-info "Installing unattended-upgrades for automatic security updates…"
-sudo apt-get update >/dev/null
-sudo DEBIAN_FRONTEND=noninteractive apt-get install -y unattended-upgrades apt-listchanges >/dev/null
-done_msg "unattended-upgrades package installed"
-echo
-
-info "Configuring unattended-upgrades to apply security updates automatically…"
-sudo bash -c 'cat << "UPG_CNF" > /etc/apt/apt.conf.d/20auto-upgrades
-APT::Periodic::Update-Package-Lists "1";
-APT::Periodic::Unattended-Upgrade "1";
-APT::Periodic::AutocleanInterval "7";
-UPG_CNF'
-sudo sed -i 's|//   "o=Ubuntu,a=noble-security";|   "o=Ubuntu,a=noble-security";|' \
-    /etc/apt/apt.conf.d/50unattended-upgrades
-done_msg "unattended-upgrades configured for daily security updates"
-echo
-
-info "Enabling and starting the unattended-upgrades service…"
-sudo systemctl enable unattended-upgrades >/dev/null
-sudo systemctl start unattended-upgrades
-done_msg "unattended-upgrades service is active"
-echo
-
-### 24) BIOS Reminder: Auto Power-On After AC Loss ###
-info "Reminder: Configure BIOS to 'Power On After AC Loss'…"
-echo -e "${YELLOW}Please reboot your ThinkCentre and enter BIOS/UEFI to set:${RESET}"
-echo -e "   → Power Management → Restore on AC/Power Loss → ${GREEN}Power On${RESET}"
-echo -e "${YELLOW}This ensures the machine will automatically boot after a power outage.${RESET}"
-echo
-
-### 25) Final Summary & All Service IPs/Ports ###
+### 24) Final Summary ###
 echo -e "${GREEN}###############################################################${RESET}"
 echo -e "${GREEN}#                                                           #${RESET}"
-echo -e "${GREEN}#  Smart-Home + Mini-Lab Stack Is Now Running!               #${RESET}"
+echo -e "${GREEN}#  Modular Smart Home Hub Setup Complete!                    #${RESET}"
 echo -e "${GREEN}#                                                           #${RESET}"
 echo -e "${GREEN}###############################################################${RESET}"
 echo
 
-echo -e "${BLUE}Access your services at:${RESET}"
+echo -e "${PURPLE}🔍 Complete Discovery System:${RESET}"
+echo "  • Registry file:     $SERVICE_REGISTRY"
+echo "  • Hub config:        $HUB_CONFIG" 
+echo "  • Discovery helper:  $HUB_ROOT/discovery-helper.sh"
+echo "  • Service template:  $HUB_ROOT/add-service-template.sh"
+echo "  • Data location:     $HUB_ROOT/[service-name]/"
+echo "  • Auto-discovery:    100% automatic for backup/restore"
+
+echo
+echo -e "${BLUE}🏠 Smart Home Services:${RESET}"
+if [ -f "$SERVICE_REGISTRY" ] && command -v jq >/dev/null 2>&1; then
+  jq -r '.services[] | select(.description | contains("Home") or contains("Smart") or contains("Automation")) | "  • \(.name): \(.url)"' "$SERVICE_REGISTRY" 2>/dev/null || echo "  • Services registered in $SERVICE_REGISTRY"
+else
+  echo "  • Home Assistant:    http://$LOCAL_IP:8123"
+  echo "  • Zigbee2MQTT:       http://$LOCAL_IP:8081 (if available)"
+  echo "  • Homebridge:        http://$LOCAL_IP:8581"
+  echo "  • Scrypted:          https://$LOCAL_IP:10443"
+fi
+
+echo
+echo -e "${BLUE}🔧 Management Services:${RESET}"
 echo "  • Portainer:         http://$LOCAL_IP:9000"
-echo "  • Zigbee2MQTT UI:    http://$LOCAL_IP:8081  (if Zigbee dongle present)"
-echo "  • Scrypted:          https://$LOCAL_IP:10443"
-echo "  • Homebridge UI:     http://$LOCAL_IP:8581"
 echo "  • Heimdall:          http://$LOCAL_IP:8201"
-echo "  • Home Assistant:    http://$LOCAL_IP:8123"
-echo "  • Plex Media Server: http://$LOCAL_IP:32400"
-echo "  • InfluxDB API:      http://$LOCAL_IP:8086"
-echo "  • Grafana UI:        http://$LOCAL_IP:3000"
-echo "  • Pi-hole UI:        http://$LOCAL_IP/admin"
 echo "  • Uptime Kuma:       http://$LOCAL_IP:3001"
 echo "  • Netdata:           http://$LOCAL_IP:19999"
+echo "  • Grafana:           http://$LOCAL_IP:3000 (admin/admin)"
+echo "  • InfluxDB:          http://$LOCAL_IP:8086 (admin/adminpassword)"
 
 echo
-echo "Monthly backups of /srv/hub run at 02:00 on the 1st of each month."
-echo "The nuc-hub.sh script re-runs at 03:00 on the 2nd of each month."
-echo "Nightly security updates via unattended-upgrades ensure OS patches."
-echo -e "${YELLOW}Don't forget to configure BIOS 'Power On After AC Loss'.${RESET}"
+echo -e "${BLUE}🌐 Network Services:${RESET}"
+echo "  • Pi-hole Admin:     http://$LOCAL_IP/admin (password: changeme)"
+echo "  • Plex Media:        http://$LOCAL_IP:32400"
+
 echo
+echo -e "${PURPLE}💾 Modular Backup System:${RESET}"
+echo "  • Auto-discovery:    All services automatically backed up"
+echo "  • Registry-based:    New services auto-detected"
+echo "  • Data location:     All in /srv/hub/ for easy backup"
+echo "  • Schedule:          Monthly at 2AM on 1st"
+
+echo
+echo -e "${PURPLE}🔒 Security Features:${RESET}"
+echo "  • UFW Firewall:       Active with service-specific rules"
+echo "  • fail2ban:           Active intrusion prevention"
+echo "  • SMART monitoring:   Enabled for disk health"
+
+echo
+echo -e "${YELLOW}📝 Next Steps:${RESET}"
+echo "1. Get backup-hub.sh and restore-hub.sh scripts"
+echo "2. Configure BIOS 'Power On After AC Loss'"
+echo "3. Access services and configure as needed"
+echo "4. To add services: Follow the modular pattern and register_service"
+
+echo
+echo -e "${GREEN}✅ Modular hub ready! Add services easily with auto-backup.${RESET}"
